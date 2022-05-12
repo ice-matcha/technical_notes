@@ -1,0 +1,262 @@
+<?php
+namespace App\Services\MQ;
+
+
+// use App\Facades\SystemLog;
+use PhpAmqpLib\Connection\AbstractConnection;
+use PhpAmqpLib\Connection\Heartbeat\PCNTLHeartbeatSender;
+use PhpAmqpLib\Exception\AMQPRuntimeException;
+// use Rex\MessageQueue\Drivers\AMQP;
+// use Rex\MessageQueue\Facades\MQ;
+// use Rex\MessageQueue\Objects\PublishModel;
+
+class SimpleClient
+{
+    /**
+     * MQ 实例
+     *
+     * @var AMQP
+     */
+    public $mq;
+
+    /**
+     * MQ 连接配置 
+     * 
+     * @var 
+     */
+    private $connection;
+
+    /**
+     * 路由key
+     *
+     * @var string
+     */
+    private $routingKey;
+
+    /**
+     * 维护心跳
+     *
+     * @var PCNTLHeartbeatSender
+     */
+    private $heartbeatHandler;
+
+    /**
+     * @var bool
+     */
+    private static $hasInit = false;
+
+    /**
+     * 链接空闲时间上限
+     *
+     * @var int
+     */
+    private $leftIdleTimeOUt;
+
+    /**
+     * 链接空闲时间上限：默认 300s
+     */
+    const DEFAULT_IDLE_TIME_OUT = 300;
+
+    /**
+     * 没有链接空闲（单次消费即退出）
+     */
+    const NULL_IDLE_TIME_OUT = 0;
+
+    /**
+     * 空闲沉睡时间
+     */
+    const IDLE_SLEEP_TIME = 5;
+
+    /**
+     * SimpleAMQPClient constructor.
+     */
+    public function __construct(string $connection = null, string $routingKey = null, int $leftIdleTimeOUt = self::DEFAULT_IDLE_TIME_OUT)
+    {
+        $this->connection = $connection;
+        $this->routingKey = $routingKey;
+
+        if ($connection) {
+            $this->init($connection, $routingKey, $leftIdleTimeOUt);
+        }
+    }
+
+
+    /**
+     * 初始化配置
+     *
+     * @param string $connection
+     * @param string|null $routingKey
+     * @return bool
+     * @throws \Exception
+     */
+    public function init(string $connection, string $routingKey = null, int $idleTimeOut = self::DEFAULT_IDLE_TIME_OUT): bool
+    {
+        if (self::$hasInit) {
+            throw new \LogicException("存在重复注册 PCNTLHeartbeatSender 的风险");
+        }
+
+        // 创建连接
+        $this->connection = $connection;
+        $this->mq = MQ::connection($this->connection);
+        $this->mq->setModel(PublishModel::RETURN);
+
+        // 注册心跳
+//        $abstractConnection = $this->getAbstractConnection($this->mq);
+        $this->heartbeatHandler = new PCNTLHeartbeatSender($this->mq->getConnection());
+        $this->heartbeatHandler->register();
+
+        if ($routingKey) {
+            $this->routingKey = $routingKey;
+        } else {
+            $this->routingKey = $this->getDefaultRoutingKey();
+        }
+        $this->leftIdleTimeOUt = $idleTimeOut;
+
+        // 全局唯一
+        self::$hasInit = true;
+        return true;
+    }
+
+    public function __destruct()
+    {
+        // 取消心跳注册
+        if ($this->heartbeatHandler) {
+            $this->heartbeatHandler->unregister();
+        }
+    }
+
+    /**
+     * 从 AMQP 解析出 原生的 MQ 信息
+     *
+     * @param AMQP $amqp
+     * @return AbstractConnection
+     */
+    public function getAbstractConnection(AMQP $amqp): AbstractConnection
+    {
+        $closure = function (): AbstractConnection {
+            return $this->connection;
+        };
+
+        return $closure->call($this->mq);
+    }
+
+
+
+    /**
+     * 发送消息 (TODO 优化发送消息)
+     *
+     * @param $message
+     * @return bool
+     */
+    public function simplePush($message, $dumpError = false): bool
+    {
+        try {
+            $correlationId = $this->mq->push($message, $this->routingKey);
+
+            return true;
+        } catch (\Exception $e) {
+            if ($dumpError) {
+                dump($e->getMessage(), $e->getTraceAsString());
+            }
+
+            // 记录日志
+            $this->defaultErrorHandle($e, $message);
+
+            return false;
+        }
+    }
+
+    /**
+     * 消费消息
+     *
+     * @param \Closure $successFunc
+     * @param \Closure|null $failedFunc
+     */
+    public function simpleConsume(\Closure $successFunc, \Closure $failedFunc = null): void
+    {
+        while ($this->leftIdleTimeOUt >= 0) {
+            if ($this->mq->size() > 0 && $data = $this->mq->pop()) {
+                try {
+                    // 获取消息体
+                    $message = $data->getBody();
+
+                    // TODO bindTo 效率是否更高
+                    // 调用成功回调（闭包绑定当前对象实例）
+                    $res = call_user_func($successFunc, $message);
+
+                    // 如果没有显示返回 false，则认为处理成功
+                    if ($res !== false) {
+                        $this->mq->ack();
+                    }
+                } catch (\Throwable $e) {
+                    if ($failedFunc) {
+                        // 执行用户错误回调
+                        $this->userErrorHandleAdapter($failedFunc, $e, $data);
+                    } else {
+                        // 执行默认回调
+                        $this->defaultErrorHandle($e, $data);
+                    }
+                }
+
+            } else {
+               $this->leftIdleTimeOUt -= self::IDLE_SLEEP_TIME;
+
+               if ($this->leftIdleTimeOUt >= self::NULL_IDLE_TIME_OUT) {
+                   sleep(self::IDLE_SLEEP_TIME);
+               }
+            }
+
+            $this->mq->checkHeartBeat();
+        }
+    }
+
+
+
+    /**
+     * @return string
+     */
+    /**
+     * 获取默认的 routingKey
+     *
+     * @return string
+     * @throws \Exception
+     */
+    private function getDefaultRoutingKey(): string
+    {
+        $default = array_first(array_values(config("mq.connections.{$this->connection}.binding")));
+        if (!$default) {
+            throw new \Exception("MQ 读取{$this->connection} 的默认路由配置");
+        }
+
+        return $default;
+    }
+
+
+
+    /**
+     * 用户定义的异常处理
+     *
+     * @param \Closure $closure
+     * @param \Throwable $e
+     * @param $response
+     */
+    private function userErrorHandleAdapter(\Closure $closure, \Throwable $e, $response): void
+    {
+//        $closure->call($this, $e, $response);
+        call_user_func($closure, $e, $response);
+    }
+
+    /**
+     * 默认异常处理（写日志）
+     *
+     * @param \Throwable $e
+     * @param $response
+     */
+    private function defaultErrorHandle(\Throwable $e, $response): void
+    {
+        // $message = sprintf("消息处理失败，原因：%s，错误栈：%s，当前消息：%s", $e->getMessage(),
+        //     $e->getTraceAsString(), var_export($response, true));
+        // SystemLog::setType(sprintf("rabbitmq_%s_%s", $this->connection, $this->routingKey))
+        //     ->error($message);
+    }
+}
